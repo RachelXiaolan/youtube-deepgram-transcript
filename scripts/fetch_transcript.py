@@ -189,6 +189,9 @@ def main():
     fetch_p.add_argument("-f", "--format", choices=["md", "json", "text"], default="md",
                          help="Output format (default: md)")
     fetch_p.add_argument("-p", "--platform", default=None, help="Force platform (skip auto-detect)")
+    fetch_p.add_argument("--api-key", default=None, dest="api_key",
+                         help="Deepgram API key (overrides DEEPGRAM_API_KEY env var). "
+                              "Use this if you don't want to set the env var permanently.")
 
     # --- platforms ---
     sub.add_parser("platforms", help="List supported platforms")
@@ -205,6 +208,10 @@ def main():
         return
 
     # fetch (or default)
+    # Honor --api-key if given (overrides env var for this run)
+    if getattr(args, "api_key", None):
+        os.environ["DEEPGRAM_API_KEY"] = args.api_key
+
     output = fetch_transcript(
         args.video,
         language=args.language,

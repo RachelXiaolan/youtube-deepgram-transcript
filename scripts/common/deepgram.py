@@ -86,6 +86,8 @@ def transcribe_deepgram(audio_path: str, language: str = "en") -> dict | None:
     api_key = os.environ.get("DEEPGRAM_API_KEY", "")
     if not api_key:
         _log("DEEPGRAM_API_KEY not set, skipping Tier 2", "WARN")
+        _log("Set it via: export DEEPGRAM_API_KEY='your-key'  OR  pass --api-key on the CLI", "INFO")
+        _log("Get a free key ($200 credit) at https://console.deepgram.com", "INFO")
         return None
 
     try:
