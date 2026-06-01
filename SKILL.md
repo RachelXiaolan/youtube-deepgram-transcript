@@ -117,9 +117,49 @@ All of these work:
 
 ## Workflow for Summarization
 
-1. Run `scripts/fetch_transcript.py <url>` to get the transcript in Markdown
-2. Use the transcript as input for AI summarization
-3. Optional: use the prompt template in `templates/summary-prompt.md`
+### Recommended: Confirm → Fetch (2-step)
+
+**Step 1: Show video info for confirmation**
+
+```bash
+python scripts/fetch_transcript.py info "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+Output:
+```markdown
+## 📺 Video Confirmation
+
+**Title:** How to Build AI Agents in 2025
+**URL:** https://www.youtube.com/watch?v=VIDEO_ID
+**Duration:** 15m 32s
+**Channel:** AI Explained
+**Upload date:** 2025-06-01
+
+**Available subtitle languages:** en, zh-Hans
+→ Tier 1 (subtitles) will be used
+```
+
+Review the info, confirm with the user, then proceed.
+
+**Step 2: Fetch transcript**
+
+```bash
+python scripts/fetch_transcript.py fetch "https://www.youtube.com/watch?v=VIDEO_ID" -l zh
+```
+
+### Direct fetch (skip confirmation, backward compatible)
+
+```bash
+python scripts/fetch_transcript.py "VIDEO_URL"
+```
+
+### Multi-video from a channel
+
+```bash
+python scripts/fetch_videos.py "https://www.youtube.com/@username" 10
+```
+
+Then pass each `video_id` to `fetch_transcript.py fetch`.
 
 ## Environment Variables
 

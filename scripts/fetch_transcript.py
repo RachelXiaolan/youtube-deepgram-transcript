@@ -47,6 +47,116 @@ def _extract_video_id(input_str: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Proxy helper
+# ---------------------------------------------------------------------------
+
+def _get_proxy() -> str | None:
+    """Get proxy from YOUTUBE_PROXY or HTTPS_PROXY / ALL_PROXY env vars."""
+    for var in ("YOUTUBE_PROXY", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        val = os.environ.get(var, "")
+        if val:
+            return val
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Video info (pre-flight metadata fetch)
+# ---------------------------------------------------------------------------
+
+def get_video_info(video_input: str) -> dict:
+    """
+    Fetch lightweight video metadata for the confirmation step.
+
+    Returns dict with:
+      - video_id, title, duration_seconds, duration_str
+      - available_subtitle_languages: list of language codes (empty if none/blocked)
+      - deepgram_available: bool (whether DEEPGRAM_API_KEY is set)
+      - url
+    """
+    video_id = _extract_video_id(video_input)
+    url = f"https://www.youtube.com/watch?v={video_id}"
+
+    # --- Fetch metadata via yt-dlp ---
+    info = {"video_id": video_id, "url": url}
+    cmd = [sys.executable, "-m", "yt_dlp", "--dump-json", "--no-warnings", url]
+    proxy = _get_proxy()
+    if proxy:
+        cmd.extend(["--proxy", proxy])
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            dur = data.get("duration", 0)
+            info["title"] = data.get("title", "Unknown")
+            info["duration_seconds"] = dur
+            info["duration_str"] = f"{int(dur) // 60}m {int(dur) % 60}s"
+            info["uploader"] = data.get("uploader", "")
+            info["upload_date"] = data.get("upload_date", "")
+        else:
+            info["title"] = "Unknown (yt-dlp failed)"
+            info["duration_seconds"] = 0
+            info["duration_str"] = "unknown"
+    except Exception:
+        info["title"] = "Unknown (yt-dlp timeout)"
+        info["duration_seconds"] = 0
+        info["duration_str"] = "unknown"
+
+    # --- Check available subtitle languages ---
+    info["available_subtitle_languages"] = []
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        # Set proxy
+        if proxy:
+            for var in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
+                if not os.environ.get(var):
+                    os.environ[var] = proxy
+        api = YouTubeTranscriptApi()
+        transcript_list = api.list(video_id)
+        langs = []
+        for t in transcript_list:
+            langs.append(t.language_code)
+        info["available_subtitle_languages"] = langs
+    except Exception:
+        pass  # IP blocked or no subtitles
+
+    # --- Check Deepgram availability ---
+    info["deepgram_available"] = bool(os.environ.get("DEEPGRAM_API_KEY", ""))
+
+    return info
+
+
+def format_video_info_md(info: dict) -> str:
+    """Format video info as a human-readable Markdown confirmation block."""
+    lines = [
+        "## 📺 Video Confirmation\n",
+        f"**Title:** {info.get('title', 'Unknown')}",
+        f"**URL:** {info.get('url', '')}",
+        f"**Duration:** {info.get('duration_str', 'unknown')}",
+    ]
+    if info.get("uploader"):
+        lines.append(f"**Channel:** {info['uploader']}")
+    if info.get("upload_date"):
+        d = info["upload_date"]
+        lines.append(f"**Upload date:** {d[:4]}-{d[4:6]}-{d[6:8]}")
+
+    lines.append("")
+    sub_langs = info.get("available_subtitle_languages", [])
+    if sub_langs:
+        lines.append(f"**Available subtitle languages:** {', '.join(sub_langs)}")
+        lines.append("→ Tier 1 (subtitles) will be used")
+    elif info.get("deepgram_available"):
+        lines.append("**Subtitles:** Not available / blocked")
+        lines.append("→ Tier 2 (Deepgram audio transcription) will be used (~$0.0043/min)")
+    else:
+        lines.append("**Subtitles:** Not available / blocked")
+        lines.append("**Deepgram:** Not configured (no DEEPGRAM_API_KEY)")
+        lines.append("→ Tier 3 (metadata only: title + description) — ⚠️ limited content")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Tier 1: youtube-transcript-api
 # ---------------------------------------------------------------------------
 
@@ -135,15 +245,6 @@ def _fetch_subtitles(video_id: str, language: str = "en"):
 # ---------------------------------------------------------------------------
 # Tier 2: yt-dlp audio download + Deepgram Nova-3
 # ---------------------------------------------------------------------------
-
-def _get_proxy() -> str | None:
-    """Get proxy from YOUTUBE_PROXY or HTTPS_PROXY / ALL_PROXY env vars."""
-    for var in ("YOUTUBE_PROXY", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
-        val = os.environ.get(var, "")
-        if val:
-            return val
-    return None
-
 
 def _download_audio(video_id: str, output_dir: str) -> str | None:
     """Download best-quality audio from YouTube, return path to file or None."""
@@ -303,6 +404,10 @@ def _fetch_metadata(video_id: str):
         sys.executable, "-m", "yt_dlp",
         "--dump-json", "--no-warnings", url,
     ]
+    proxy = _get_proxy()
+    if proxy:
+        cmd.extend(["--proxy", proxy])
+
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
@@ -337,7 +442,7 @@ def _fetch_metadata(video_id: str):
 # Markdown output formatter
 # ---------------------------------------------------------------------------
 
-def _format_transcript_md(result: dict) -> str:
+def _format_transcript_md(result: dict, output_language: str = "") -> str:
     """Convert transcript result to clean Markdown."""
     if not result or not result.get("transcript"):
         return "*No transcript available.*\n"
@@ -351,7 +456,9 @@ def _format_transcript_md(result: dict) -> str:
     method = result.get("method", "unknown")
     lines.append(f"> Source: {method_label.get(method, method)}")
     if result.get("language"):
-        lines.append(f"> Language: {result['language']}")
+        lines.append(f"> Transcript Language: {result['language']}")
+    if output_language:
+        lines.append(f"> Output Language: {output_language}")
     if result.get("duration_seconds"):
         dur = result["duration_seconds"]
         lines.append(f"> Duration: {int(dur) // 60}m {int(dur) % 60}s")
@@ -457,18 +564,36 @@ def fetch_transcript(video_input: str, language: str = "en", output_format: str 
 if __name__ == "__main__":
     import argparse
 
+    # --- Pre-parse: inject "fetch" as default subcommand for backward compat ---
+    # If first arg is not "info" or "fetch" and not a flag, treat it as "fetch <arg>"
+    argv = sys.argv[1:]
+    if argv and argv[0] not in ("info", "fetch", "-h", "--help", "-l", "-f"):
+        argv = ["fetch"] + argv
+
     parser = argparse.ArgumentParser(
         description="Fetch YouTube transcript with 3-tier fallback (subtitles → Deepgram → metadata)"
     )
-    parser.add_argument("video", help="YouTube URL or video ID")
-    parser.add_argument("-l", "--language", default="en", help="Language code (default: en, use 'auto' for auto-detect)")
-    parser.add_argument(
-        "-f", "--format",
-        choices=["md", "json", "text"],
-        default="md",
-        help="Output format (default: md)",
-    )
-    args = parser.parse_args()
+    sub = parser.add_subparsers(dest="command", help="Command to run")
 
-    output = fetch_transcript(args.video, args.language, args.format)
-    print(output)
+    # --- info subcommand (confirmation step) ---
+    info_parser = sub.add_parser("info", help="Show video info for confirmation before fetching")
+    info_parser.add_argument("video", help="YouTube URL or video ID")
+
+    # --- fetch subcommand (actual transcript) ---
+    fetch_parser = sub.add_parser("fetch", help="Fetch transcript")
+    fetch_parser.add_argument("video", help="YouTube URL or video ID")
+    fetch_parser.add_argument("-l", "--language", default="en",
+                              help="Language code (default: en, use 'auto' for auto-detect)")
+    fetch_parser.add_argument("-f", "--format",
+                              choices=["md", "json", "text"], default="md",
+                              help="Output format (default: md)")
+
+    args = parser.parse_args(argv)
+
+    if args.command == "info":
+        info = get_video_info(args.video)
+        print(format_video_info_md(info))
+    else:
+        # "fetch" or no command (backward compat handled by pre-parse)
+        output = fetch_transcript(args.video, args.language, args.format)
+        print(output)
