@@ -1,554 +1,139 @@
 #!/usr/bin/env python3
 """
-Fetch transcript for a YouTube video with three-tier fallback:
+Fetch transcript for any video URL with a 3-tier fallback pipeline.
 
-  Tier 1: youtube-transcript-api (subtitles, free, instant)
-  Tier 2: yt-dlp audio download → Deepgram Nova-3 transcription ($0.0043/min)
-  Tier 3: yt-dlp metadata (title + description, last resort)
+Supported platforms (auto-detected from URL):
+  - YouTube    (full 3-tier: subtitles → Deepgram → metadata)
+  - Generic    (Tier 2/3 only via yt-dlp: Bilibili, Douyin, X, Vimeo, ...)
 
-Requires:
-  pip install youtube-transcript-api yt-dlp deepgram-sdk
+Add a new platform: drop a new file under scripts/platforms/ and register
+it in scripts/platforms/__init__.py.
+
+Usage:
+    # Pre-flight: show video info for user confirmation
+    python fetch_transcript.py info "https://www.youtube.com/watch?v=VIDEO_ID"
+
+    # Fetch transcript (auto-detects platform)
+    python fetch_transcript.py fetch "https://www.youtube.com/watch?v=VIDEO_ID" -l en
+
+    # Explicit platform (skip auto-detection)
+    python fetch_transcript.py fetch "https://example.com/video" --platform generic
+
+    # Backward compat: bare URL/ID is treated as 'fetch'
+    python fetch_transcript.py "VIDEO_ID"
+    python fetch_transcript.py "https://www.youtube.com/watch?v=VIDEO_ID" -l zh
+
+    # List supported platforms
+    python fetch_transcript.py platforms
 
 Environment:
-  DEEPGRAM_API_KEY  (optional — enables Tier 2; without it, skips to Tier 3)
+    DEEPGRAM_API_KEY  (optional — enables Tier 2; without it, falls back to Tier 3)
+    YOUTUBE_PROXY / HTTPS_PROXY / ALL_PROXY  (optional — proxy for cloud servers)
 """
 
+from __future__ import annotations
 import json
 import os
-import re
 import sys
-import subprocess
-import tempfile
-import time
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# Add scripts/ to sys.path so we can import common/ and platforms/ as packages
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from platforms import match_adapter, list_adapters, get_adapter
+from common.deepgram import fetch_via_deepgram
+from common.metadata import fetch_metadata
+from common.formatter import format_transcript_md, format_video_info_md
+
 
 def _log(msg: str, level: str = "INFO"):
-    """Structured logging to stderr so stdout stays clean JSON."""
     print(f"[{level}] {msg}", file=sys.stderr)
 
 
-def _extract_video_id(input_str: str) -> str:
-    """Parse a video ID from various YouTube URL formats or a raw 11-char ID."""
-    patterns = [
-        r"(?:v=|/v/|youtu\.be/)([A-Za-z0-9_-]{11})",
-        r"(?:embed/)([A-Za-z0-9_-]{11})",
-        r"(?:shorts/)([A-Za-z0-9_-]{11})",
-        r"^([A-Za-z0-9_-]{11})$",
-    ]
-    for pat in patterns:
-        m = re.search(pat, input_str)
-        if m:
-            return m.group(1)
-    raise ValueError(f"Cannot extract video ID from: {input_str}")
-
-
 # ---------------------------------------------------------------------------
-# Proxy helper
+# Core pipeline
 # ---------------------------------------------------------------------------
 
-def _get_proxy() -> str | None:
-    """Get proxy from YOUTUBE_PROXY or HTTPS_PROXY / ALL_PROXY env vars."""
-    for var in ("YOUTUBE_PROXY", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
-        val = os.environ.get(var, "")
-        if val:
-            return val
-    return None
+def get_video_info(video_input: str, platform: str | None = None) -> dict:
+    """Pre-flight: detect platform and return video metadata for confirmation."""
+    adapter = match_adapter(video_input, force_platform=platform)
 
+    if adapter.name == "generic":
+        # Generic adapter expects the URL itself (no extractable video ID)
+        info = adapter.get_info(video_input)
+    else:
+        video_id = adapter.extract_video_id(video_input)
+        info = adapter.get_info(video_id)
 
-# ---------------------------------------------------------------------------
-# Video info (pre-flight metadata fetch)
-# ---------------------------------------------------------------------------
-
-def get_video_info(video_input: str) -> dict:
-    """
-    Fetch lightweight video metadata for the confirmation step.
-
-    Returns dict with:
-      - video_id, title, duration_seconds, duration_str
-      - available_subtitle_languages: list of language codes (empty if none/blocked)
-      - deepgram_available: bool (whether DEEPGRAM_API_KEY is set)
-      - url
-    """
-    video_id = _extract_video_id(video_input)
-    url = f"https://www.youtube.com/watch?v={video_id}"
-
-    # --- Fetch metadata via yt-dlp ---
-    info = {"video_id": video_id, "url": url}
-    cmd = [sys.executable, "-m", "yt_dlp", "--dump-json", "--no-warnings", url]
-    proxy = _get_proxy()
-    if proxy:
-        cmd.extend(["--proxy", proxy])
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            dur = data.get("duration", 0)
-            info["title"] = data.get("title", "Unknown")
-            info["duration_seconds"] = dur
-            info["duration_str"] = f"{int(dur) // 60}m {int(dur) % 60}s"
-            info["uploader"] = data.get("uploader", "")
-            info["upload_date"] = data.get("upload_date", "")
-        else:
-            info["title"] = "Unknown (yt-dlp failed)"
-            info["duration_seconds"] = 0
-            info["duration_str"] = "unknown"
-    except Exception:
-        info["title"] = "Unknown (yt-dlp timeout)"
-        info["duration_seconds"] = 0
-        info["duration_str"] = "unknown"
-
-    # --- Check available subtitle languages ---
-    info["available_subtitle_languages"] = []
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-        # Set proxy
-        if proxy:
-            for var in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
-                if not os.environ.get(var):
-                    os.environ[var] = proxy
-        api = YouTubeTranscriptApi()
-        transcript_list = api.list(video_id)
-        langs = []
-        for t in transcript_list:
-            langs.append(t.language_code)
-        info["available_subtitle_languages"] = langs
-    except Exception:
-        pass  # IP blocked or no subtitles
-
-    # --- Check Deepgram availability ---
-    info["deepgram_available"] = bool(os.environ.get("DEEPGRAM_API_KEY", ""))
-
+    info.setdefault("platform", adapter.name)
     return info
 
 
-def format_video_info_md(info: dict) -> str:
-    """Format video info as a human-readable Markdown confirmation block."""
-    lines = [
-        "## 📺 Video Confirmation\n",
-        f"**Title:** {info.get('title', 'Unknown')}",
-        f"**URL:** {info.get('url', '')}",
-        f"**Duration:** {info.get('duration_str', 'unknown')}",
-    ]
-    if info.get("uploader"):
-        lines.append(f"**Channel:** {info['uploader']}")
-    if info.get("upload_date"):
-        d = info["upload_date"]
-        lines.append(f"**Upload date:** {d[:4]}-{d[4:6]}-{d[6:8]}")
-
-    lines.append("")
-    sub_langs = info.get("available_subtitle_languages", [])
-    if sub_langs:
-        lines.append(f"**Available subtitle languages:** {', '.join(sub_langs)}")
-        lines.append("→ Tier 1 (subtitles) will be used")
-    elif info.get("deepgram_available"):
-        lines.append("**Subtitles:** Not available / blocked")
-        lines.append("→ Tier 2 (Deepgram audio transcription) will be used (~$0.0043/min)")
-    else:
-        lines.append("**Subtitles:** Not available / blocked")
-        lines.append("**Deepgram:** Not configured (no DEEPGRAM_API_KEY)")
-        lines.append("→ Tier 3 (metadata only: title + description) — ⚠️ limited content")
-
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Tier 1: youtube-transcript-api
-# ---------------------------------------------------------------------------
-
-def _fetch_subtitles(video_id: str, language: str = "en"):
-    """Try to fetch subtitles via youtube-transcript-api."""
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound
-    except ImportError:
-        _log("youtube-transcript-api not installed, skipping Tier 1", "WARN")
-        return None
-
-    # Set proxy for youtube-transcript-api (respects HTTP_PROXY/HTTPS_PROXY)
-    proxy = _get_proxy()
-    if proxy:
-        for var in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
-            if not os.environ.get(var):
-                os.environ[var] = proxy
-        _log(f"Tier 1: using proxy {proxy[:30]}...")
-
-    api = YouTubeTranscriptApi()
-    try:
-        available = api.list(video_id)
-    except Exception as e:
-        _log(f"Tier 1: transcript listing failed: {e}", "WARN")
-        return None
-
-    # Priority: requested lang → Chinese variants → English → first available
-    lang_priority = [
-        language,
-        "zh-TW", "zh-CN", "zh-Hant", "zh-Hans", "zh",
-        "en",
-    ]
-    # Deduplicate while preserving order
-    seen = set()
-    unique_langs = []
-    for l in lang_priority:
-        if l not in seen:
-            seen.add(l)
-            unique_langs.append(l)
-
-    for lang_code in unique_langs:
-        try:
-            transcript = api.fetch(video_id, languages=[lang_code])
-            entries = []
-            for entry in transcript:
-                entries.append({
-                    "start": round(entry.start, 2),
-                    "duration": round(entry.duration, 2),
-                    "text": entry.text,
-                })
-            return {
-                "video_id": video_id,
-                "transcript": entries,
-                "method": "subtitles",
-                "language": lang_code,
-                "has_timestamps": True,
-            }
-        except Exception:
-            continue
-
-    # Try first available transcript regardless of language
-    try:
-        for t_info in available:
-            transcript = api.fetch(video_id, languages=[t_info.language_code])
-            entries = []
-            for entry in transcript:
-                entries.append({
-                    "start": round(entry.start, 2),
-                    "duration": round(entry.duration, 2),
-                    "text": entry.text,
-                })
-            return {
-                "video_id": video_id,
-                "transcript": entries,
-                "method": "subtitles",
-                "language": t_info.language_code,
-                "has_timestamps": True,
-            }
-    except Exception:
-        pass
-
-    _log("Tier 1: no subtitles found for any language", "INFO")
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Tier 2: yt-dlp audio download + Deepgram Nova-3
-# ---------------------------------------------------------------------------
-
-def _download_audio(video_id: str, output_dir: str) -> str | None:
-    """Download best-quality audio from YouTube, return path to file or None."""
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    output_template = os.path.join(output_dir, f"{video_id}.%(ext)s")
-    cmd = [
-        sys.executable, "-m", "yt_dlp",
-        "-x",                          # extract audio
-        "--audio-format", "mp3",
-        "--audio-quality", "0",        # best
-        "--no-warnings",
-        "--newline",
-        "-o", output_template,
-    ]
-
-    # Add proxy if available (e.g., Cloudflare WARP for cloud servers)
-    proxy = _get_proxy()
-    if proxy:
-        cmd.extend(["--proxy", proxy])
-        _log(f"Using proxy: {proxy[:30]}...")
-
-    cmd.append(url)
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            _log(f"yt-dlp download failed: {result.stderr.strip()}", "WARN")
-            return None
-        # Find the downloaded file
-        for ext in ("mp3", "m4a", "webm", "opus", "wav"):
-            path = os.path.join(output_dir, f"{video_id}.{ext}")
-            if os.path.exists(path):
-                return path
-        _log("yt-dlp finished but output file not found", "WARN")
-        return None
-    except subprocess.TimeoutExpired:
-        _log("yt-dlp download timed out (5min)", "WARN")
-        return None
-    except Exception as e:
-        _log(f"yt-dlp error: {e}", "WARN")
-        return None
-
-
-def _transcribe_deepgram(audio_path: str, language: str = "en") -> dict | None:
-    """Send audio to Deepgram Nova-3 and return timestamped transcript.
-
-    Supports deepgram-sdk >= 3.0 (including v7.x Fern-generated API):
-      client = DeepgramClient(api_key=...)
-      client.listen.v1.media.transcribe_file(request=bytes, model="nova-3", ...)
-    """
-    api_key = os.environ.get("DEEPGRAM_API_KEY", "")
-    if not api_key:
-        _log("DEEPGRAM_API_KEY not set, skipping Tier 2", "WARN")
-        return None
-
-    try:
-        from deepgram import DeepgramClient
-    except ImportError:
-        _log("deepgram-sdk not installed, skipping Tier 2", "WARN")
-        return None
-
-    try:
-        client = DeepgramClient(api_key=api_key)
-
-        with open(audio_path, "rb") as f:
-            audio_data = f.read()
-
-        # Build kwargs — only pass language when not auto-detecting
-        detect_lang = language in ("auto", "unknown", "")
-        kwargs = dict(
-            request=audio_data,
-            model="nova-3",
-            smart_format=True,
-            punctuate=True,
-            paragraphs=True,
-            detect_language=detect_lang or None,
-        )
-        if not detect_lang:
-            kwargs["language"] = language
-
-        _log(f"Sending to Deepgram Nova-3 (lang={language if not detect_lang else 'auto-detect'})...")
-        response = client.listen.v1.media.transcribe_file(**kwargs)
-
-        # Convert response to dict — SDK v7 returns Pydantic-like objects
-        if hasattr(response, "model_dump"):
-            result = response.model_dump()
-        elif hasattr(response, "to_dict"):
-            result = response.to_dict()
-        else:
-            result = json.loads(json.dumps(response))
-
-        # Parse words into our standard format
-        entries = []
-        channels = result.get("results", {}).get("channels", [])
-        for channel in channels:
-            for alt in channel.get("alternatives", []):
-                for word in alt.get("words", []):
-                    entries.append({
-                        "start": round(word.get("start", 0), 2),
-                        "duration": round(word.get("end", 0) - word.get("start", 0), 2),
-                        "text": word.get("word", word.get("punctuated_word", "")),
-                    })
-                # If no words, fall back to full transcript
-                if not entries and alt.get("transcript"):
-                    entries = [{
-                        "start": 0,
-                        "duration": round(alt.get("duration", 0), 2),
-                        "text": alt["transcript"],
-                    }]
-                break  # Only use first alternative
-
-        if not entries:
-            _log("Deepgram returned empty transcript", "WARN")
-            return None
-
-        detected_lang = channels[0].get("detected_language", language) if channels else language
-
-        return {
-            "transcript": entries,
-            "method": "deepgram",
-            "language": detected_lang or language,
-            "has_timestamps": True,
-            "duration_seconds": round(entries[-1]["start"] + entries[-1]["duration"], 2) if entries else 0,
-        }
-    except Exception as e:
-        _log(f"Deepgram transcription failed: {e}", "WARN")
-        return None
-
-
-def _fetch_via_deepgram(video_id: str, language: str = "en"):
-    """Full Tier 2 pipeline: download audio → transcribe → cleanup."""
-    with tempfile.TemporaryDirectory(prefix="yt-transcript-") as tmpdir:
-        _log(f"Tier 2: downloading audio for {video_id}...")
-        audio_path = _download_audio(video_id, tmpdir)
-        if not audio_path:
-            return None
-
-        file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
-        _log(f"Audio downloaded: {os.path.basename(audio_path)} ({file_size_mb:.1f} MB)")
-
-        _log("Tier 2: transcribing with Deepgram Nova-3...")
-        result = _transcribe_deepgram(audio_path, language)
-        if result:
-            result["video_id"] = video_id
-        # tmpdir auto-cleans
-        return result
-
-
-# ---------------------------------------------------------------------------
-# Tier 3: yt-dlp metadata fallback
-# ---------------------------------------------------------------------------
-
-def _fetch_metadata(video_id: str):
-    """Last resort: get title + description via yt-dlp."""
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    cmd = [
-        sys.executable, "-m", "yt_dlp",
-        "--dump-json", "--no-warnings", url,
-    ]
-    proxy = _get_proxy()
-    if proxy:
-        cmd.extend(["--proxy", proxy])
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            return None
-        data = json.loads(result.stdout)
-        duration = data.get("duration", 0)
-        pseudo = (
-            f"Title: {data.get('title', '')}\n\n"
-            f"Description:\n{data.get('description', '')}\n\n"
-            f"Duration: {duration // 60}m {duration % 60}s\n"
-            f"Uploader: {data.get('uploader', '')}\n"
-            f"Upload date: {data.get('upload_date', '')}"
-        )
-        return {
-            "video_id": video_id,
-            "transcript": [{
-                "start": 0,
-                "duration": float(duration),
-                "text": pseudo,
-            }],
-            "method": "metadata",
-            "language": "unknown",
-            "has_timestamps": False,
-            "note": "No subtitles available and Deepgram skipped/failed. Using title + description.",
-        }
-    except Exception as e:
-        _log(f"Tier 3 metadata fetch failed: {e}", "WARN")
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Markdown output formatter
-# ---------------------------------------------------------------------------
-
-def _format_transcript_md(result: dict, output_language: str = "") -> str:
-    """Convert transcript result to clean Markdown."""
-    if not result or not result.get("transcript"):
-        return "*No transcript available.*\n"
-
-    lines = []
-    method_label = {
-        "subtitles": "📝 Subtitles",
-        "deepgram": "🎙️ Deepgram Nova-3 Transcription",
-        "metadata": "📋 Video Metadata (no subtitles or audio transcription available)",
-    }
-    method = result.get("method", "unknown")
-    lines.append(f"> Source: {method_label.get(method, method)}")
-    if result.get("language"):
-        lines.append(f"> Transcript Language: {result['language']}")
-    if output_language:
-        lines.append(f"> Output Language: {output_language}")
-    if result.get("duration_seconds"):
-        dur = result["duration_seconds"]
-        lines.append(f"> Duration: {int(dur) // 60}m {int(dur) % 60}s")
-    lines.append("")
-
-    entries = result["transcript"]
-
-    if method == "metadata":
-        # Just dump the text as-is
-        lines.append(entries[0]["text"])
-        return "\n".join(lines)
-
-    if method == "deepgram":
-        # Deepgram gives word-level timestamps; group into ~10s chunks
-        # for readability
-        chunk_text = []
-        current_chunk = []
-        chunk_start = 0.0
-        for entry in entries:
-            if not current_chunk:
-                chunk_start = entry["start"]
-            current_chunk.append(entry["text"])
-            chunk_end = entry["start"] + entry["duration"]
-            if chunk_end - chunk_start >= 10.0 or entry is entries[-1]:
-                ts = _fmt_ts(chunk_start)
-                text = " ".join(current_chunk)
-                chunk_text.append(f"[{ts}] {text}")
-                current_chunk = []
-                chunk_start = chunk_end
-        lines.extend(chunk_text)
-    else:
-        # Subtitles — already sentence-level, just format
-        for entry in entries:
-            ts = _fmt_ts(entry["start"])
-            lines.append(f"[{ts}] {entry['text']}")
-
-    return "\n".join(lines)
-
-
-def _fmt_ts(seconds: float) -> str:
-    """Format seconds as MM:SS."""
-    m = int(seconds) // 60
-    s = int(seconds) % 60
-    return f"{m:02d}:{s:02d}"
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def fetch_transcript(video_input: str, language: str = "en", output_format: str = "md"):
-    """
-    Three-tier fallback transcript fetcher.
+def fetch_transcript(
+    video_input: str,
+    language: str = "en",
+    output_format: str = "md",
+    platform: str | None = None,
+) -> str:
+    """Three-tier fallback transcript fetcher (auto-detects platform).
 
     Args:
-        video_input: YouTube URL or 11-char video ID.
-        language: Language code (default: "en"). Use "auto" for auto-detect.
-        output_format: "md" (markdown, default), "json" (raw JSON), "text" (plain text).
+        video_input: URL or video ID
+        language: language code or "auto"
+        output_format: "md" | "json" | "text"
+        platform: force a specific platform (skip auto-detection)
 
-    Returns:
-        str: Formatted transcript.
+    Returns: formatted transcript string
     """
-    video_id = _extract_video_id(video_input)
+    adapter = match_adapter(video_input, force_platform=platform)
 
-    # --- Tier 1: Subtitles ---
-    _log(f"Tier 1: fetching subtitles for {video_id}...")
-    result = _fetch_subtitles(video_id, language)
-    if result:
-        _log(f"✅ Tier 1 success (subtitles, lang={result['language']})")
+    # --- Resolve video_id and watch URL for downstream tiers ---
+    if adapter.name == "generic":
+        url = video_input if video_input.startswith("http") else f"https://{video_input}"
+        video_id = adapter.extract_video_id(url)
     else:
-        # --- Tier 2: Deepgram ---
-        _log("Tier 1 failed, trying Tier 2: Deepgram audio transcription...")
-        result = _fetch_via_deepgram(video_id, language)
+        video_id = adapter.extract_video_id(video_input)
+        url = adapter.get_stream_url(video_id)
+
+    _log(f"Platform: {adapter.name} | video_id={video_id} | url={url[:80]}")
+
+    # --- Tier 1: native subtitles (if platform supports it) ---
+    result = None
+    if adapter.SUPPORTS_SUBTITLES:
+        _log(f"Tier 1: fetching subtitles via {adapter.name}...")
+        result = adapter.fetch_subtitles(video_id, language)
+        if result:
+            _log(f"✅ Tier 1 success ({adapter.name} subtitles, lang={result['language']})")
+
+    # --- Tier 2: Deepgram audio transcription (shared, platform-agnostic) ---
+    if not result:
+        _log("Tier 1 unavailable/failed, trying Tier 2: Deepgram...")
+        result = fetch_via_deepgram(url, language, video_id_hint=video_id)
         if result:
             dur = result.get("duration_seconds", 0)
             _log(f"✅ Tier 2 success (Deepgram, {int(dur)//60}m{int(dur)%60}s)")
-        else:
-            # --- Tier 3: Metadata ---
-            _log("Tier 2 failed/skipped, trying Tier 3: metadata fallback...")
-            result = _fetch_metadata(video_id)
-            if result:
-                _log("⚠️ Tier 3: using metadata only (title + description)")
-            else:
-                _log("❌ All tiers failed", "ERROR")
-                result = {
-                    "video_id": video_id,
-                    "transcript": None,
-                    "method": "failed",
-                    "error": "All three tiers failed: no subtitles, no Deepgram, no metadata",
-                }
+
+    # --- Tier 3: metadata fallback (shared) ---
+    if not result:
+        _log("Tier 2 unavailable/failed, trying Tier 3: metadata...")
+        result = fetch_metadata(url, video_id)
+        if result:
+            _log("⚠️ Tier 3: using metadata only")
+
+    if not result:
+        _log("❌ All tiers failed", "ERROR")
+        result = {
+            "video_id": video_id,
+            "transcript": None,
+            "method": "failed",
+            "error": "All three tiers failed",
+            "platform": adapter.name,
+        }
+
+    # Tag result with platform
+    result.setdefault("platform", adapter.name)
 
     # --- Output formatting ---
     if output_format == "json":
@@ -558,42 +143,76 @@ def fetch_transcript(video_input: str, language: str = "en", output_format: str 
             return " ".join(e["text"] for e in result["transcript"])
         return ""
     else:  # md (default)
-        return _format_transcript_md(result)
+        return format_transcript_md(result)
 
 
-if __name__ == "__main__":
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _cmd_platforms():
+    """Print available platforms."""
+    print("\nSupported platforms:\n")
+    for adapter in list_adapters():
+        auth = " (auth required)" if adapter.REQUIRES_AUTH else ""
+        sub = "Tier 1 ✅" if adapter.SUPPORTS_SUBTITLES else "Tier 2/3 only"
+        print(f"  {adapter.name:<12}  {sub}{auth}")
+        if adapter.URL_PATTERNS and adapter.name != "generic":
+            print(f"               patterns: {len(adapter.URL_PATTERNS)}")
+    print("\nGeneric adapter covers 1500+ sites via yt-dlp (Bilibili, Douyin, X, Vimeo, ...)")
+    print("Add a dedicated adapter: see scripts/platforms/__init__.py\n")
+
+
+def main():
     import argparse
 
-    # --- Pre-parse: inject "fetch" as default subcommand for backward compat ---
-    # If first arg is not "info" or "fetch" and not a flag, treat it as "fetch <arg>"
+    # Pre-parse for backward compat: bare URL/ID → treat as "fetch <URL>"
     argv = sys.argv[1:]
-    if argv and argv[0] not in ("info", "fetch", "-h", "--help", "-l", "-f"):
+    if argv and argv[0] not in ("info", "fetch", "platforms", "-h", "--help"):
         argv = ["fetch"] + argv
 
     parser = argparse.ArgumentParser(
-        description="Fetch YouTube transcript with 3-tier fallback (subtitles → Deepgram → metadata)"
+        description="Fetch video transcript with 3-tier fallback (subtitles → Deepgram → metadata)"
     )
     sub = parser.add_subparsers(dest="command", help="Command to run")
 
-    # --- info subcommand (confirmation step) ---
-    info_parser = sub.add_parser("info", help="Show video info for confirmation before fetching")
-    info_parser.add_argument("video", help="YouTube URL or video ID")
+    # --- info ---
+    info_p = sub.add_parser("info", help="Show video info for confirmation before fetching")
+    info_p.add_argument("video", help="Video URL or ID")
+    info_p.add_argument("-p", "--platform", default=None, help="Force platform (skip auto-detect)")
 
-    # --- fetch subcommand (actual transcript) ---
-    fetch_parser = sub.add_parser("fetch", help="Fetch transcript")
-    fetch_parser.add_argument("video", help="YouTube URL or video ID")
-    fetch_parser.add_argument("-l", "--language", default="en",
-                              help="Language code (default: en, use 'auto' for auto-detect)")
-    fetch_parser.add_argument("-f", "--format",
-                              choices=["md", "json", "text"], default="md",
-                              help="Output format (default: md)")
+    # --- fetch ---
+    fetch_p = sub.add_parser("fetch", help="Fetch transcript")
+    fetch_p.add_argument("video", help="Video URL or ID")
+    fetch_p.add_argument("-l", "--language", default="en",
+                         help="Language code (default: en, use 'auto' for auto-detect)")
+    fetch_p.add_argument("-f", "--format", choices=["md", "json", "text"], default="md",
+                         help="Output format (default: md)")
+    fetch_p.add_argument("-p", "--platform", default=None, help="Force platform (skip auto-detect)")
+
+    # --- platforms ---
+    sub.add_parser("platforms", help="List supported platforms")
 
     args = parser.parse_args(argv)
 
+    if args.command == "platforms":
+        _cmd_platforms()
+        return
+
     if args.command == "info":
-        info = get_video_info(args.video)
+        info = get_video_info(args.video, platform=args.platform)
         print(format_video_info_md(info))
-    else:
-        # "fetch" or no command (backward compat handled by pre-parse)
-        output = fetch_transcript(args.video, args.language, args.format)
-        print(output)
+        return
+
+    # fetch (or default)
+    output = fetch_transcript(
+        args.video,
+        language=args.language,
+        output_format=args.format,
+        platform=args.platform,
+    )
+    print(output)
+
+
+if __name__ == "__main__":
+    main()
