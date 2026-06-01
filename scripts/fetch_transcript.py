@@ -34,6 +34,7 @@ Environment:
 from __future__ import annotations
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -46,6 +47,27 @@ from platforms import match_adapter, list_adapters, get_adapter
 from common.deepgram import fetch_via_deepgram
 from common.metadata import fetch_metadata
 from common.formatter import format_transcript_md, format_video_info_md
+
+
+def _check_proxy_works(proxy: str | None, timeout: int = 10) -> bool:
+    """Quick health check: can the proxy actually reach the internet?
+
+    Used by CLI entrypoints to fail fast when YOUTUBE_PROXY points at a
+    dead WARP/socks5 instance. Returns True if proxy is None (direct mode)
+    or if a Cloudflare trace request via the proxy succeeds.
+    """
+    if not proxy:
+        return True  # no proxy requested, always "ok"
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "--max-time", str(timeout),
+             "--socks5-hostname", proxy.replace("socks5://", "").replace("socks5h://", ""),
+             "https://www.cloudflare.com/cdn-cgi/trace"],
+            capture_output=True, text=True, timeout=timeout + 2,
+        )
+        return "warp=on" in result.stdout or "ip=" in result.stdout
+    except Exception:
+        return False
 
 
 def _log(msg: str, level: str = "INFO"):
@@ -192,6 +214,13 @@ def main():
     fetch_p.add_argument("--api-key", default=None, dest="api_key",
                          help="Deepgram API key (overrides DEEPGRAM_API_KEY env var). "
                               "Use this if you don't want to set the env var permanently.")
+    fetch_p.add_argument("--require-proxy", default=False, action="store_true",
+                         help="Fail fast if YOUTUBE_PROXY is set but unreachable. "
+                              "Useful for cron: detect dead WARP and abort instead of "
+                              "producing garbage Tier-3 metadata output.")
+    fetch_p.add_argument("--no-proxy-fallback", default=False, action="store_true",
+                         help="If YOUTUBE_PROXY is set but unreachable, silently clear "
+                              "it and try direct connection. Useful for development.")
 
     # --- platforms ---
     sub.add_parser("platforms", help="List supported platforms")
@@ -211,6 +240,23 @@ def main():
     # Honor --api-key if given (overrides env var for this run)
     if getattr(args, "api_key", None):
         os.environ["DEEPGRAM_API_KEY"] = args.api_key
+
+    # Proxy health check (cron-friendly)
+    from common.proxy import get_proxy
+    proxy = get_proxy()
+    if proxy:
+        if not _check_proxy_works(proxy):
+            _log(f"Proxy {proxy} is configured but unreachable", "WARN")
+            if getattr(args, "require_proxy", False):
+                _log("--require-proxy set: aborting to avoid garbage output", "ERROR")
+                sys.exit(2)
+            elif getattr(args, "no_proxy_fallback", False):
+                _log("--no-proxy-fallback: clearing proxy env vars and trying direct")
+                for k in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
+                          "ALL_PROXY", "all_proxy", "YOUTUBE_PROXY"):
+                    os.environ.pop(k, None)
+            else:
+                _log("Will try with proxy anyway (may produce Tier 3 fallback output)")
 
     output = fetch_transcript(
         args.video,
