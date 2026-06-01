@@ -97,25 +97,42 @@ def transcribe_deepgram(audio_path: str, language: str = "en") -> dict | None:
         return None
 
     try:
-        client = DeepgramClient(api_key=api_key)
-
-        with open(audio_path, "rb") as f:
-            audio_data = f.read()
-
-        detect_lang = language in ("auto", "unknown", "")
-        kwargs = dict(
-            request=audio_data,
-            model="nova-3",
-            smart_format=True,
-            punctuate=True,
-            paragraphs=True,
-            detect_language=detect_lang or None,
+        # Deepgram API does NOT need our YouTube-bypass proxy — and forcing it
+        # through SOCKS requires `httpx[socks]` (socksio) which may not be
+        # installed. Clear proxy env vars BEFORE constructing the client,
+        # because DeepgramClient initializes its httpx client eagerly and
+        # caches proxy settings from env at construction time.
+        _proxy_env_keys = (
+            "HTTP_PROXY", "http_proxy",
+            "HTTPS_PROXY", "https_proxy",
+            "ALL_PROXY", "all_proxy",
+            "YOUTUBE_PROXY",
         )
-        if not detect_lang:
-            kwargs["language"] = language
+        _saved_env = {k: os.environ.pop(k) for k in _proxy_env_keys if k in os.environ}
 
-        _log(f"Sending to Deepgram Nova-3 (lang={language if not detect_lang else 'auto-detect'})...")
-        response = client.listen.v1.media.transcribe_file(**kwargs)
+        try:
+            client = DeepgramClient(api_key=api_key)
+
+            with open(audio_path, "rb") as f:
+                audio_data = f.read()
+
+            detect_lang = language in ("auto", "unknown", "")
+            kwargs = dict(
+                request=audio_data,
+                model="nova-3",
+                smart_format=True,
+                punctuate=True,
+                paragraphs=True,
+                detect_language=detect_lang or None,
+            )
+            if not detect_lang:
+                kwargs["language"] = language
+
+            _log(f"Sending to Deepgram Nova-3 (lang={language if not detect_lang else 'auto-detect'})...")
+            response = client.listen.v1.media.transcribe_file(**kwargs)
+        finally:
+            # Restore env vars (Tier 1 / Tier 2 download may still need them)
+            os.environ.update(_saved_env)
 
         # SDK v7 returns Pydantic-like; v3 returns dict-like
         if hasattr(response, "model_dump"):
