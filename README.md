@@ -114,6 +114,25 @@ Deepgram free tier: **$200 credit on signup** → enough for ~770 hours of audio
 | Markdown output (default) | ✅ | ❌ | ❌ | ❌ |
 | Cost (no-subtitle) | ~$0.04/10min | N/A (fails) | N/A (fails) | Free (needs GPU) |
 
+## Cloud Server Setup (AWS / GCP / Azure)
+
+YouTube blocks cloud IPs. Run a **Cloudflare WARP proxy** (free) to bypass:
+
+```bash
+# One-time setup
+docker run -d --name warproxy --cap-add NET_ADMIN \
+  --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+  -p 1080:1080 kingcc/warproxy
+
+# Use with the skill
+export YOUTUBE_PROXY=socks5://127.0.0.1:1080
+python3 scripts/fetch_transcript.py "VIDEO_URL"
+```
+
+The script auto-detects `YOUTUBE_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY`.
+
+See [references/cloud-server-guide.md](references/cloud-server-guide.md) for all proxy options.
+
 ## License
 
 MIT

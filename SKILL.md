@@ -138,23 +138,25 @@ All of these work:
 | Video download hangs | yt-dlp may be rate-limited. Update: `pip install -U yt-dlp` |
 | Wrong language detected | Pass `-l zh` or `-l en` explicitly |
 
-## ⚠️ Known Limitations
+## ⚠️ Cloud Server Users (AWS / GCP / Azure)
 
-### Cloud IP Blocks (AWS / GCP / Azure)
-YouTube aggressively blocks requests from cloud provider IPs. If you're running on a server:
-- **Tier 1** (`youtube-transcript-api`) may return "IP blocked" errors
-- **Tier 2** (`yt-dlp` download) may require `--cookies-from-browser` authentication
-- **Workaround**: Run on a local machine (MacBook, home PC) or use proxies
+YouTube blocks requests from cloud IPs. If you're running on a server, you need a proxy.
 
-This is a YouTube-side restriction that affects all server-based tools, not just this skill. On a personal machine with residential IP, all three tiers work reliably.
+**Quickest fix — Cloudflare WARP (free, one command):**
 
-### Cookies for YouTube (optional)
-For Tier 2 on servers, you can export cookies:
 ```bash
-# Export cookies from your browser (run on your local machine)
-yt-dlp --cookies-from-browser chrome --cookies cookies.txt "https://youtube.com/..."
+# Start WARP proxy
+docker run -d --name warproxy --cap-add NET_ADMIN \
+  --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+  -p 1080:1080 kingcc/warproxy
+
+# Use it
+YOUTUBE_PROXY=socks5://127.0.0.1:1080 python3 scripts/fetch_transcript.py "VIDEO_URL"
 ```
-Then pass `--cookies cookies.txt` to yt-dlp (modify the script or set env var).
+
+The script auto-detects proxy from `YOUTUBE_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` env vars.
+
+See [`references/cloud-server-guide.md`](references/cloud-server-guide.md) for all options (WARP, PO Token, residential proxies, Tor).
 
 ## Comparison with Other Skills
 

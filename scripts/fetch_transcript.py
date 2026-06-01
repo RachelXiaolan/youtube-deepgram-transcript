@@ -58,6 +58,14 @@ def _fetch_subtitles(video_id: str, language: str = "en"):
         _log("youtube-transcript-api not installed, skipping Tier 1", "WARN")
         return None
 
+    # Set proxy for youtube-transcript-api (respects HTTP_PROXY/HTTPS_PROXY)
+    proxy = _get_proxy()
+    if proxy:
+        for var in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
+            if not os.environ.get(var):
+                os.environ[var] = proxy
+        _log(f"Tier 1: using proxy {proxy[:30]}...")
+
     api = YouTubeTranscriptApi()
     try:
         available = api.list(video_id)
@@ -128,6 +136,15 @@ def _fetch_subtitles(video_id: str, language: str = "en"):
 # Tier 2: yt-dlp audio download + Deepgram Nova-3
 # ---------------------------------------------------------------------------
 
+def _get_proxy() -> str | None:
+    """Get proxy from YOUTUBE_PROXY or HTTPS_PROXY / ALL_PROXY env vars."""
+    for var in ("YOUTUBE_PROXY", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        val = os.environ.get(var, "")
+        if val:
+            return val
+    return None
+
+
 def _download_audio(video_id: str, output_dir: str) -> str | None:
     """Download best-quality audio from YouTube, return path to file or None."""
     url = f"https://www.youtube.com/watch?v={video_id}"
@@ -140,8 +157,16 @@ def _download_audio(video_id: str, output_dir: str) -> str | None:
         "--no-warnings",
         "--newline",
         "-o", output_template,
-        url,
     ]
+
+    # Add proxy if available (e.g., Cloudflare WARP for cloud servers)
+    proxy = _get_proxy()
+    if proxy:
+        cmd.extend(["--proxy", proxy])
+        _log(f"Using proxy: {proxy[:30]}...")
+
+    cmd.append(url)
+
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
