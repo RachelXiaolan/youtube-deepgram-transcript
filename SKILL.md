@@ -47,9 +47,9 @@ URL → auto-detect platform → Tier 1 (platform-specific subtitle API)
                               ❌ Just title + description
 ```
 
-## Requirements
+## Installation
 
-### Core (Tier 1 + Tier 3 — free, works out of the box)
+### Step 1: Core dependencies (required)
 
 ```bash
 pip install youtube-transcript-api yt-dlp
@@ -57,15 +57,41 @@ pip install youtube-transcript-api yt-dlp
 
 Also ensure `ffmpeg` is installed (`brew install ffmpeg` / `apt install ffmpeg`).
 
-### Optional: Tier 2 — Deepgram cloud transcription
+After this, **Tier 1 (native YouTube subtitles, free)** and **Tier 3 (metadata only, free)** work immediately.
 
-```bash
-pip install deepgram-sdk
-```
+### Step 2: Deepgram setup (agent should ask the user)
 
-Set `DEEPGRAM_API_KEY` in environment. Without it, Tier 2 is skipped automatically — no errors.
+**⚠️ Agent instructions: Do NOT silently skip or auto-install Deepgram. Walk the user through this:**
 
-> **New users:** Tier 1 (native YouTube subtitles) covers ~60-70% of YouTube videos for free. Only install Deepgram if you need no-subtitle fallback.
+Show the user this prompt:
+
+> **Tier 2 — Deepgram Nova-3 Cloud Transcription**
+>
+> This adds audio transcription for videos **without subtitles** (~30-40% of YouTube, and all non-YouTube sites like Bilibili/Vimeo/X).
+>
+> | | Without Deepgram | With Deepgram |
+> |---|---|---|
+> | YouTube with subtitles | ✅ Free | ✅ Free |
+> | YouTube without subtitles | ❌ Metadata only | ✅ ~$0.04/10min |
+> | Bilibili / Vimeo / X / etc. | ❌ Metadata only | ✅ ~$0.04/10min |
+>
+> **Cost:** Deepgram gives **$200 free credit** on signup (≈46,000 minutes / ~770 hours). That's enough for months of personal use.
+>
+> Want to set up Deepgram? (yes / no / later)
+
+**If the user says yes:**
+
+1. `pip install deepgram-sdk`
+2. Send the user to: **https://console.deepgram.com** → sign up → create an API key
+3. Wait for the user to return with their API key
+4. Save the key:
+   - **Hermes Agent:** run `hermes config set DEEPGRAM_API_KEY <key>` or add to `~/.hermes/.env`
+   - **Claude Code / other agents:** add `export DEEPGRAM_API_KEY=<key>` to `~/.bashrc` or `.env`
+5. Verify: `python scripts/fetch_transcript.py info "https://www.youtube.com/watch?v=dQw4w9WgXcQ"`
+
+**If the user says no or later:**
+
+That's fine! Tier 1 and Tier 3 work without it. They can set `DEEPGRAM_API_KEY` anytime later to activate Tier 2.
 
 ## Quick Start
 
