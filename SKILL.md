@@ -5,7 +5,7 @@ description: >
   Deepgram Nova-3 audio transcription → metadata. Supports YouTube natively
   and 1500+ sites (Bilibili, Vimeo, X, Douyin, ...) via yt-dlp. Use when the
   user shares ANY video URL and wants a transcript or summary.
-required_environment_variables:
+optional_environment_variables:
   - DEEPGRAM_API_KEY
 ---
 
@@ -49,13 +49,23 @@ URL → auto-detect platform → Tier 1 (platform-specific subtitle API)
 
 ## Requirements
 
+### Core (Tier 1 + Tier 3 — free, works out of the box)
+
 ```bash
-pip install youtube-transcript-api yt-dlp deepgram-sdk
+pip install youtube-transcript-api yt-dlp
 ```
 
-Also ensure:
-- `ffmpeg` is installed (`brew install ffmpeg` / `apt install ffmpeg`)
-- `DEEPGRAM_API_KEY` is set in environment (optional — enables Tier 2)
+Also ensure `ffmpeg` is installed (`brew install ffmpeg` / `apt install ffmpeg`).
+
+### Optional: Tier 2 — Deepgram cloud transcription
+
+```bash
+pip install deepgram-sdk
+```
+
+Set `DEEPGRAM_API_KEY` in environment. Without it, Tier 2 is skipped automatically — no errors.
+
+> **New users:** Tier 1 (native YouTube subtitles) covers ~60-70% of YouTube videos for free. Only install Deepgram if you need no-subtitle fallback.
 
 ## Quick Start
 
